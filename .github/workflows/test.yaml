@@ -1,0 +1,17 @@
+name: Test Go Project
+
+on:
+  pull_request_target:
+    types: [opened, reopened] 
+    branches: ["main", "master"] 
+
+jobs:
+  test-project:
+    uses: cx-actions-2025/cx-actions/.github/workflows/codex-go.yaml@main
+    with:
+      team-name: ${{ vars.TEAM_NAME }} 
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+      machine_name: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }} 
+    secrets:
+      backend-url: ${{ secrets.BACKEND_URL }}
+      auth-key: ${{ secrets.AUTH_KEY }}

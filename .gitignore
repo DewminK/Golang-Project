@@ -1,0 +1,6 @@
+.temp/
+.idea/
+.vscode/
+
+coverage
+go.sum

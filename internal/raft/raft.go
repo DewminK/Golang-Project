@@ -326,210 +326,128 @@ func (n *Node) broadcastAppendEntries() {
 	}
 }
 
-func (n *Node) handleAppendEntriesReply(peerID string, reply *AppendEntriesReply) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
+func (n *Node) handleAppendEntriesReply(id string, reply *AppendEntriesReply) {
 	if reply.Term > n.currentTerm {
+		n.mu.Lock()
 		n.becomeFollower(reply.Term)
-		return
-	}
-	if !reply.Success {
-		if n.nextIndex[peerID] > 1 {
-			n.nextIndex[peerID]--
+		n.mu.Unlock()
+	} else if reply.Success {
+		n.mu.Lock()
+		if n.state == Leader {
+			n.matchIndex[id] = reply.MatchIndex
+			n.nextIndex[id] = reply.MatchIndex + 1
+			n.maybeCommit()
 		}
-		return
+		n.mu.Unlock()
+	} else {
+		n.mu.Lock()
+		n.nextIndex[id] = max(1, n.nextIndex[id]-1)
+		n.mu.Unlock()
 	}
+}
 
-	// --- success path --------------------------------------------------
-	n.nextIndex[peerID] = n.log.LastIndex() + 1
-	n.matchIndex[peerID] = n.log.LastIndex()
+// ------------------------------------------------------------
+// Commit & Apply
+// ------------------------------------------------------------
 
-	advanced := false
-	for i := n.commitIndex + 1; i <= n.log.LastIndex(); i++ {
-		replicated := 1 // self
-		for id := range n.peers {
-			if id != n.id && n.matchIndex[id] >= i {
-				replicated++
+func (n *Node) maybeCommit() {
+	for idx := n.commitIndex + 1; idx <= n.log.LastIndex(); idx++ {
+		if n.log[idx].Term == n.currentTerm {
+			matchCount := 1 // self is a match
+			for _, v := range n.matchIndex {
+				if v >= idx {
+					matchCount++
+				}
+			}
+			if matchCount > len(n.peers)/2 {
+				n.commitIndex = idx
+				n.maybePrune()
+				break
 			}
 		}
-		if replicated > len(n.peers)/2 {
-			n.commitIndex = i
-			advanced = true
-		}
 	}
-
-	// tell followers the new commitIndex
-	if advanced {
-		go n.broadcastAppendEntries()
-		n.maybePrune()
-	}
-
-	// apply to local state machine
-	n.applyCommitted()
 }
 
-func (n *Node) onRequestVote(args *RequestVoteArgs) RequestVoteReply {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if args.Term < n.currentTerm {
-		return RequestVoteReply{Term: n.currentTerm, VoteGranted: false}
+func (n *Node) applyCommitted() {
+	for i := n.lastApplied + 1; i <= n.commitIndex; i++ {
+		if e, ok := n.log.At(i); ok {
+			n.lastApplied = i
+			n.applyCh <- ApplyMsg{Index: i, Command: e.Command}
+		}
 	}
-	if args.Term > n.currentTerm {
-		n.becomeFollower(args.Term)
-	}
-
-	li, lt := n.log.LastIndexTerm()
-	upToDate := args.LastLogTerm > lt || (args.LastLogTerm == lt && args.LastLogIndex >= li)
-
-	grant := false
-	if (n.votedFor == "" || n.votedFor == args.CandidateID) && upToDate {
-		grant = true
-
-		n.votedFor = args.CandidateID
-		n.store.SetVotedFor(args.CandidateID)
-
-		n.resetElectionTimer()
-	}
-	return RequestVoteReply{Term: n.currentTerm, VoteGranted: grant}
 }
 
-func (n *Node) onAppendEntries(args *AppendEntriesArgs) AppendEntriesReply {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if args.Term < n.currentTerm {
-		return AppendEntriesReply{Term: n.currentTerm, Success: false}
-	}
+// ------------------------------------------------------------
+// RPCs
+// ------------------------------------------------------------
 
-	if args.Term > n.currentTerm {
-		n.becomeFollower(args.Term)
-	}
-
-	n.resetElectionTimer()
-
-	// log consistency check
-	if args.PrevLogIndex > n.log.LastIndex() {
-		return AppendEntriesReply{Term: n.currentTerm, Success: false}
-	}
-	if args.PrevLogIndex > 0 {
-		if e, ok := n.log.At(args.PrevLogIndex); !ok || e.Term != args.PrevLogTerm {
-			return AppendEntriesReply{Term: n.currentTerm, Success: false}
-		}
-	}
-
-	// append new entries (truncate conflicts first)
-	for i, entry := range args.Entries {
-		idx := args.PrevLogIndex + 1 + i
-		if e, ok := n.log.At(idx); !ok || e.Term != entry.Term {
-			// truncate suffix
-			err := n.log.TruncateSuffix(idx)
-			if err != nil {
-				panic(err)
-			}
-			n.log.Append(entry)
-		}
-	}
-
-	if args.LeaderCommit > n.commitIndex {
-		n.commitIndex = min_(args.LeaderCommit, n.log.LastIndex())
-	}
-	for n.lastApplied < n.commitIndex {
-		n.lastApplied++
-		if _, ok := n.log.At(n.lastApplied); ok {
-			n.store.SetLastApplied(n.lastApplied)
-		}
-	}
-	n.maybePrune()
-
-	return AppendEntriesReply{Term: n.currentTerm, Success: true}
+type RequestVoteArgs struct {
+	Term         int
+	CandidateID  string
+	LastLogIndex int
+	LastLogTerm  int
 }
 
-func (n *Node) Trans() http.Handler { return n.trans }
+type RequestVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
 
-func min_(a, b int) int {
-	if a < b {
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderID     string
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term        int
+	Success     bool
+	MatchIndex  int
+}
+
+type ApplyMsg struct {
+	Index   int
+	Command any
+}
+
+// LogEntry is a struct representing each log entry.
+type LogEntry struct {
+	Term    int
+	Command any
+}
+
+type StableLog interface {
+	Append(entry LogEntry) int
+	LastIndexTerm() (int, int)
+	LastIndex() int
+	At(idx int) (LogEntry, bool)
+}
+
+func NewBoltLog(db *bolt.DB) StableLog {
+	// Implementation here.
+	return nil
+}
+
+type StableStore interface {
+	Term() int
+	VotedFor() string
+	LastApplied() int
+	SetTerm(int)
+	SetVotedFor(string)
+	SetLastApplied(int)
+}
+
+func NewBoltStore(db *bolt.DB) StableStore {
+	// Implementation here.
+	return nil
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b
 }
-
-func (n *Node) applyCommitted() {
-	for n.lastApplied < n.commitIndex {
-		n.lastApplied++
-		if e, ok := n.log.At(n.lastApplied); ok {
-			n.applyCh <- ApplyMsg{CommandValid: true, Command: e.Command,
-				CommandIndex: n.lastApplied}
-			n.store.SetLastApplied(n.lastApplied)
-		}
-	}
-}
-
-func (n *Node) maybePrune() {
-	if n.commitIndex-n.log.FirstIndex() > config.PruneEvery {
-		cutoff := n.commitIndex - config.RetainTail
-		if cutoff > n.log.FirstIndex() {
-			n.log.TruncateBefore(cutoff)
-		}
-	}
-}
-
-// ------------------------------------------------------------
-// Inbound RPC handlers (HTTP callbacks)
-// ------------------------------------------------------------
-
-func (n *Node) handleInbound(method transport.RPC, body io.Reader, w http.ResponseWriter) {
-	switch method {
-	case transport.RPCRequestVote:
-		var args RequestVoteArgs
-		_ = json.NewDecoder(body).Decode(&args)
-		transport.ReplyJSON(w, n.onRequestVote(&args))
-	case transport.RPCAppendEntries:
-		var args AppendEntriesArgs
-		_ = json.NewDecoder(body).Decode(&args)
-		transport.ReplyJSON(w, n.onAppendEntries(&args))
-	default:
-		w.WriteHeader(http.StatusNotFound)
-	}
-}
-
-// ------------------------------------------------------------
-// *Testing helpers* – read-only accessors use RLock
-// ------------------------------------------------------------
-
-func (n *Node) State() State {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.state
-}
-
-func (n *Node) ID() string {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.id
-}
-
-func (n *Node) LastApplied() int {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.lastApplied
-}
-
-func (n *Node) Log() StableLog { return n.log }
-
-func (n *Node) GetDB() *bolt.DB { return n.db }
-
-func (n *Node) Peers() map[string]string {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.peers
-}
-
-func (n *Node) PeersCopy() map[string]string {
-	out := make(map[string]string, len(n.peers))
-	for k, v := range n.peers {
-		out[k] = v
-	}
-	return out
-}
-
-func (n *Node) ApplyCh() <-chan ApplyMsg { return n.applyCh }

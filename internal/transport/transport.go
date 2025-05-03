@@ -24,9 +24,9 @@ type HTTPTransport struct {
 	handler HandlerFunc
 }
 
-func New(handler HandlerFunc) *HTTPTransport {
+func New(handler HandlerFunc, timeout time.Duration) *HTTPTransport {
 	return &HTTPTransport{
-		client:  &http.Client{Timeout: 3 * time.Second},
+		client:  &http.Client{Timeout: timeout},
 		handler: handler,
 	}
 }

@@ -1,8 +1,9 @@
 module mini_etcd
 
-go 1.22
+go 1.23
 
-require (
-	go.etcd.io/bbolt v1.3.11 // indirect
-	golang.org/x/sys v0.4.0 // indirect
-)
+toolchain go1.24.2
+
+require go.etcd.io/bbolt v1.4.0
+
+require golang.org/x/sys v0.29.0 // indirect
